@@ -22,7 +22,7 @@ fn data() -> Data {
     Data { schema, context }
 }
 
-fn graphql(st: web::Data<Arc<Data>>, data: GraphQLRequest) -> impl Responder {
+async fn graphql(st: web::Data<Arc<Data>>, data: GraphQLRequest) -> impl Responder {
     data.execute(&st.schema, &st.context)
 }
 
@@ -32,24 +32,27 @@ fn main() -> std::io::Result<()> {
 
     let data = Arc::new(data());
 
-    HttpServer::new(move || {
-        App::new()
-            .data(data.clone())
-            .wrap(middleware::Logger::default())
-            .service(
-                web::resource("/graphql")
-                    .guard(guard::Any(guard::Get()).or(guard::Post()))
-                    .to(graphql),
-            )
-            .service(
-                web::resource("/graphiql")
-                    .route(web::get().to(|| graphiql_source("http://localhost:8088/graphql"))),
-            )
-            .service(
-                web::resource("/playground")
-                    .route(web::get().to(|| playground_source("http://localhost:8088/graphql"))),
-            )
-    })
-    .bind("localhost:8088")?
-    .run()
+    futures::executor::block_on(
+        HttpServer::new(move || {
+            App::new()
+                .data(data.clone())
+                .wrap(middleware::Logger::default())
+                .service(
+                    web::resource("/graphql")
+                        .guard(guard::Any(guard::Get()).or(guard::Post()))
+                        .to(graphql),
+                )
+                .service(
+                    web::resource("/graphiql")
+                        .route(web::get().to(|| graphiql_source("http://localhost:8088/graphql"))),
+                )
+                .service(
+                    web::resource("/playground").route(
+                        web::get().to(|| playground_source("http://localhost:8088/graphql")),
+                    ),
+                )
+        })
+        .bind("localhost:8088")?
+        .run(),
+    )
 }

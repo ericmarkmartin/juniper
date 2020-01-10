@@ -1,19 +1,30 @@
 use super::*;
 use actix_web::{http::header, test::TestRequest};
 
+use futures::executor::block_on;
+
 use url::form_urlencoded::Serializer as GetSerializer;
 
 fn make_get(uri: &str) -> Result<GraphQLRequest, Error> {
     let (req, mut payload) = TestRequest::get().uri(uri).to_http_parts();
-    GraphQLRequest::<DefaultScalarValue>::from_request(&req, &mut payload).wait()
+    block_on(GraphQLRequest::<DefaultScalarValue>::from_request(
+        &req,
+        &mut payload,
+    ))
 }
 
-fn make_post(payload: &str, content_type: &str) -> Result<GraphQLRequest, Error> {
+fn make_post<P: Into<actix_web::web::Bytes>>(
+    payload: P,
+    content_type: &str,
+) -> Result<GraphQLRequest, Error> {
     let (req, mut payload) = TestRequest::post()
         .set_payload(payload)
         .header(header::CONTENT_TYPE, content_type)
         .to_http_parts();
-    GraphQLRequest::<DefaultScalarValue>::from_request(&req, &mut payload).wait()
+    block_on(GraphQLRequest::<DefaultScalarValue>::from_request(
+        &req,
+        &mut payload,
+    ))
 }
 
 fn check_error_get(uri: &str, error: &str) {
@@ -22,7 +33,7 @@ fn check_error_get(uri: &str, error: &str) {
     assert_eq!(result.unwrap_err().to_string(), error);
 }
 
-fn check_error_post(payload: &str, content_type: &str, error: &str) {
+fn check_error_post<P: Into<actix_web::web::Bytes>>(payload: P, content_type: &str, error: &str) {
     let result = make_post(payload, content_type);
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().to_string(), error);
@@ -30,12 +41,19 @@ fn check_error_post(payload: &str, content_type: &str, error: &str) {
 
 fn check_success_get(uri: &str, expected: GraphQLRequest) {
     let (req, mut payload) = TestRequest::get().uri(uri).to_http_parts();
-    let result = GraphQLRequest::<DefaultScalarValue>::from_request(&req, &mut payload).wait();
+    let result = block_on(GraphQLRequest::<DefaultScalarValue>::from_request(
+        &req,
+        &mut payload,
+    ));
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), expected);
 }
 
-fn check_success_post(payload: &str, content_type: &str, expected: GraphQLRequest) {
+fn check_success_post<P: Into<actix_web::web::Bytes>>(
+    payload: P,
+    content_type: &str,
+    expected: GraphQLRequest,
+) {
     let result = make_post(payload, content_type);
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), expected);
@@ -205,7 +223,7 @@ fn test_empty_post_batch() {
 #[test]
 fn test_post_single() {
     let query = "{ foo { bar }}";
-    let payload = &format!(
+    let payload = format!(
         r#"{{
                 "query": "{}"
             }}"#,
@@ -221,7 +239,7 @@ fn test_post_batch() {
     let query1 = "{ foo { bar } }";
     let query2 = "{ foo { bar } }";
 
-    let payload = &format!(
+    let payload = format!(
         r#"[
         {{ "query": "{}" }},
         {{ "query": "{}" }}
@@ -236,9 +254,9 @@ fn test_post_batch() {
 #[test]
 fn test_post_duplicate_field() {
     let payload = r#"{
-                "query": "foo",
-                "query": "bar"
-            }"#;
+        "query": "foo",
+        "query": "bar"
+    }"#;
 
     check_error_post(payload, "application/json", "Json deserialize error: data did not match any variant of untagged enum GraphQLBatchRequest");
 }
@@ -247,7 +265,7 @@ fn test_post_duplicate_field() {
 fn test_post_variables() {
     let query = "quux";
     let variables = r#"{"meep": "morp"}"#;
-    let payload = &format!(
+    let payload = format!(
         r#"{{
                 "query": "{}",
                 "variables": {}
@@ -262,6 +280,6 @@ fn test_post_variables() {
 #[test]
 fn test_post_graphql() {
     let query = "{ meep { morp } }";
-    let expected = create_single_request(query, None, None);
+    let expected = create_single_request(&query, None, None);
     check_success_post(query, "application/graphql", expected);
 }

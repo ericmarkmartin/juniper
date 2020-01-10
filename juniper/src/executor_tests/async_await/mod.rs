@@ -35,8 +35,8 @@ impl User {
     }
 
     async fn delayed() -> bool {
-        let when = tokio::clock::now() + std::time::Duration::from_millis(100);
-        tokio::timer::delay(when).await;
+        let duration = std::time::Duration::from_millis(100);
+        tokio::timer::delay_for(duration).await;
         true
     }
 }
@@ -62,8 +62,8 @@ impl Query {
     }
 
     async fn delayed() -> bool {
-        let when = tokio::clock::now() + std::time::Duration::from_millis(100);
-        tokio::timer::delay(when).await;
+        let duration = std::time::Duration::from_millis(100);
+        tokio::time::delay_for(duration).await;
         true
     }
 }

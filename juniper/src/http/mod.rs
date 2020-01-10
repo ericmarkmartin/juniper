@@ -197,6 +197,20 @@ pub mod tests {
         fn post(&self, url: &str, body: &str) -> TestResponse;
     }
 
+    #[cfg(feature = "async")]
+    pub trait HTTPIntegrationAsync {
+        fn get(
+            &self,
+            url: &str,
+        ) -> std::pin::Pin<Box<dyn futures::future::Future<Output = TestResponse> + Send + 'static>>;
+        fn post(
+            &self,
+            url: &str,
+            body: &str,
+        ) -> std::pin::Pin<Box<dyn futures::future::Future<Output = TestResponse> + Send + 'static>>;
+    }
+
+    #[cfg(feature = "async")]
     #[allow(missing_docs)]
     pub fn run_http_test_suite<T: HTTPIntegration>(integration: &T) {
         println!("Running HTTP Test suite for integration");
@@ -226,6 +240,36 @@ pub mod tests {
         test_duplicate_keys(integration);
     }
 
+    #[cfg(feature = "async")]
+    #[allow(missing_docs)]
+    pub fn run_http_test_suite_async<T: HTTPIntegrationAsync>(integration: &T) {
+        println!("Running HTTP Test suite for integration");
+
+        println!("  - test_simple_get");
+        test_simple_get_async(integration);
+
+        // println!("  - test_encoded_get");
+        // test_encoded_get(integration);
+
+        // println!("  - test_get_with_variables");
+        // test_get_with_variables(integration);
+
+        // println!("  - test_simple_post");
+        // test_simple_post(integration);
+
+        // println!("  - test_batched_post");
+        // test_batched_post(integration);
+
+        // println!("  - test_invalid_json");
+        // test_invalid_json(integration);
+
+        // println!("  - test_invalid_field");
+        // test_invalid_field(integration);
+
+        // println!("  - test_duplicate_keys");
+        // test_duplicate_keys(integration);
+    }
+
     fn unwrap_json_response(response: &TestResponse) -> Json {
         serde_json::from_str::<Json>(
             response
@@ -239,6 +283,21 @@ pub mod tests {
     fn test_simple_get<T: HTTPIntegration>(integration: &T) {
         // {hero{name}}
         let response = integration.get("/?query=%7Bhero%7Bname%7D%7D");
+
+        assert_eq!(response.status_code, 200);
+        assert_eq!(response.content_type.as_str(), "application/json");
+
+        assert_eq!(
+            unwrap_json_response(&response),
+            serde_json::from_str::<Json>(r#"{"data": {"hero": {"name": "R2-D2"}}}"#)
+                .expect("Invalid JSON constant in test")
+        );
+    }
+
+    #[cfg(feature = "async")]
+    async fn test_simple_get_async<T: HTTPIntegrationAsync>(integration: &T) {
+        // {hero{name}}
+        let response = integration.get("/?query=%7Bhero%7Bname%7D%7D").await;
 
         assert_eq!(response.status_code, 200);
         assert_eq!(response.content_type.as_str(), "application/json");

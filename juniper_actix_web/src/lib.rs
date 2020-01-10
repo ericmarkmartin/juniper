@@ -35,17 +35,17 @@ Check the LICENSE file for details.
 [example]: https://github.com/graphql-rust/juniper_actix_web/blob/master/examples/actix_web_server.rs
 
 */
-use futures::{future, Future};
 
-#[cfg(feature = "async")]
-use futures03::future::{FutureExt, TryFutureExt};
+// #[cfg(feature = "async")]
+use futures::future::{err, ok, ready, Either, FutureExt, LocalBoxFuture, Ready};
+
 #[cfg(feature = "async")]
 use juniper::GraphQLTypeAsync;
 
 use actix_web::{
     dev,
     http::{Method, StatusCode},
-    web, Error, FromRequest, HttpRequest, HttpResponse, Responder,
+    web, Error, FromRequest, HttpRequest, HttpResponse, Responder, Result,
 };
 
 use juniper::{
@@ -145,7 +145,7 @@ where
                     .iter()
                     .map(|request| request.execute_async(root_node, context))
                     .collect::<Vec<_>>();
-                let responses = futures03::future::join_all(futures).await;
+                let responses = futures::future::join_all(futures).await;
                 GraphQLBatchResponse::Batch(responses)
             }
         }
@@ -313,13 +313,16 @@ impl<S> FromRequest for GraphQLRequest<S>
 where
     S: ScalarValue + 'static,
 {
-    type Error = actix_web::Error;
-    type Future = Box<dyn Future<Item = Self, Error = Error>>;
+    type Error = Error;
+    type Future = Either<
+        LocalBoxFuture<'static, Result<Self, Self::Error>>,
+        Ready<Result<Self, Self::Error>>,
+    >;
     type Config = ();
 
     fn from_request(req: &HttpRequest, payload: &mut dev::Payload) -> Self::Future {
         match req.method() {
-            &Method::GET => Box::new(future::result(
+            &Method::GET => Either::Right(ready(
                 web::Query::<StrictGraphQLRequest<S>>::from_query(req.query_string())
                     .map_err(Error::from)
                     .map(|gql_request| {
@@ -332,41 +335,34 @@ where
                     .get(actix_web::http::header::CONTENT_TYPE)
                     .and_then(|hv| hv.to_str().ok());
                 match content_type_header {
-                    Some("application/json") => Box::new(
-                        web::Json::<GraphQLBatchRequest<S>>::from_request(req, payload)
-                            .map_err(Error::from)
-                            .map(|gql_request| GraphQLRequest(gql_request.into_inner())),
-                    ),
-                    Some("application/graphql") => {
-                        Box::new(String::from_request(req, payload).map_err(Error::from).map(
-                            |query| {
-                                GraphQLRequest(GraphQLBatchRequest::Single(
-                                    JuniperGraphQLRequest::new(query, None, None),
-                                ))
-                            },
-                        ))
-                    }
-                    _ => Box::new(future::err(
-                        actix_http::error::ErrorUnsupportedMediaType("GraphQL requests should have content type `application/json` or `application/graphql`")
+                    Some("application/json") =>
+                        Either::Left(web::Json::<GraphQLBatchRequest<S>>::from_request(req, payload)
+                        .map(|res| res.map_err(Error::from).map(|gql_request| GraphQLRequest(gql_request.into_inner()))).boxed_local()),
+                    Some("application/graphql") =>
+                        String::from_request(req, payload).map(
+                            |res| res.map(
+                                |query| GraphQLRequest(GraphQLBatchRequest::Single(JuniperGraphQLRequest::new(query, None, None)))
+                            )
+                        ).boxed_local().left_future(),
+                    _ => Either::Right(err(
+                        actix_web::error::ErrorUnsupportedMediaType("GraphQL requests should have content type `application/json` or `application/graphql`")
                     )),
                 }
             }
-            _ => Box::new(future::result(Err(
-                actix_http::error::ErrorMethodNotAllowed(
-                    "GraphQL requests can only be sent with GET or POST",
-                ),
+            _ => Either::Right(err(actix_web::error::ErrorMethodNotAllowed(
+                "GraphQL requests can only be sent with GET or POST",
             ))),
         }
     }
 }
 
 impl Responder for GraphQLResponse {
-    type Error = actix_web::Error;
-    type Future = Result<HttpResponse, Error>;
+    type Error = Error;
+    type Future = Ready<Result<HttpResponse, Self::Error>>;
     fn respond_to(self, _: &HttpRequest) -> Self::Future {
         let GraphQLResponse(status, body) = self;
 
-        Ok(HttpResponse::Ok()
+        ok(HttpResponse::Ok()
             .status(status)
             .content_type("application/json")
             .body(body))
@@ -383,11 +379,14 @@ mod http_method_tests {
         http::{Method, StatusCode},
         test::TestRequest,
     };
+    use futures::executor::block_on;
 
     fn check_method(meth: Method, should_succeed: bool) {
         let (req, mut payload) = TestRequest::default().method(meth).to_http_parts();
-        let response =
-            GraphQLRequest::<DefaultScalarValue>::from_request(&req, &mut payload).wait();
+        let response = block_on(GraphQLRequest::<DefaultScalarValue>::from_request(
+            &req,
+            &mut payload,
+        ));
         match response {
             Err(e) => {
                 let status = e.as_response_error().error_response().status();
@@ -439,8 +438,9 @@ mod contenttype_tests {
         let (req, mut payload) = TestRequest::post()
             .header(header::CONTENT_TYPE, content_type)
             .to_http_parts();
-        let response =
-            GraphQLRequest::<DefaultScalarValue>::from_request(&req, &mut payload).wait();
+        let response = futures::executor::block_on(
+            GraphQLRequest::<DefaultScalarValue>::from_request(&req, &mut payload),
+        );
         match response {
             Err(e) => {
                 let status = e.as_response_error().error_response().status();
@@ -472,179 +472,153 @@ mod contenttype_tests {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use actix_rt;
-    use actix_web::{guard, web, App, HttpServer};
-    use futures::lazy;
-    use juniper::{
-        http::tests::{run_http_test_suite, HTTPIntegration, TestResponse},
-        tests::{model::Database, schema::Query},
-        EmptyMutation, RootNode,
-    };
-    use std::sync::Arc;
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//     use actix_web::{
+//         guard,
+//         test::{self, start, TestServer},
+//         web, App,
+//     };
+//     use futures::executor::block_on;
+//     use juniper::{
+//         http::tests::{run_http_test_suite, HTTPIntegration, TestResponse},
+//         tests::{model::Database, schema::Query},
+//         EmptyMutation, RootNode,
+//     };
+//     use std::sync::Arc;
 
-    type Schema = RootNode<'static, Query, EmptyMutation<Database>>;
+//     type Schema = RootNode<'static, Query, EmptyMutation<Database>>;
 
-    struct Data {
-        schema: Schema,
-        context: Database,
-    }
+//     struct Data {
+//         schema: Schema,
+//         context: Database,
+//     }
 
-    struct TestActixWebIntegration {
-        server_url: &'static str,
-    }
+//     struct TestActixWebIntegration {
+//         srv: TestServer,
+//     }
 
-    impl TestActixWebIntegration {
-        fn new(server_url: &'static str) -> TestActixWebIntegration {
-            TestActixWebIntegration { server_url }
-        }
-    }
+//     impl TestActixWebIntegration {
+//         fn new(srv: TestServer) -> TestActixWebIntegration {
+//             TestActixWebIntegration { srv }
+//         }
 
-    impl HTTPIntegration for TestActixWebIntegration {
-        fn get(&self, url: &str) -> TestResponse {
-            let url = format!("http://{}{}", self.server_url, url);
-            actix_rt::System::new("get_request")
-                .block_on(lazy(|| {
-                    awc::Client::default()
-                        .get(&url)
-                        .send()
-                        .map(make_test_response)
-                }))
-                .expect(&format!("failed GET {}", url))
-        }
+//         fn test_endpoint(&self, endpoint: &str, expected: &str) {
+//             println!("URL: {}", endpoint);
+//             let request = self.srv.get(endpoint);
+//             let body = block_on(
+//                 request
+//                     .send()
+//                     .then(|response| response.expect(&format!("failed GET {}", endpoint)).body())
+//                     .map(|body| String::from_utf8(body.unwrap().to_vec()).unwrap()),
+//             );
 
-        fn post(&self, url: &str, body: &str) -> TestResponse {
-            let url = format!("http://{}{}", self.server_url, url);
-            actix_rt::System::new("post_request")
-                .block_on(lazy(|| {
-                    awc::Client::default()
-                        .post(&url)
-                        .header(awc::http::header::CONTENT_TYPE, "application/json")
-                        .send_body(body.to_string())
-                        .map(make_test_response)
-                }))
-                .expect(&format!("failed POST {}", url))
-        }
-    }
+//             assert_eq!(body, expected);
+//         }
+//     }
 
-    type Resp = awc::ClientResponse<
-        actix_http::encoding::Decoder<actix_http::Payload<actix_http::PayloadStream>>,
-    >;
+//     impl HTTPIntegration for TestActixWebIntegration {
+//         fn get(&self, url: &str) -> TestResponse {
+//             let request = self.srv.get(url);
+//             block_on(request.send().then(make_test_response)).expect(&format!("failed GET {}", url))
+//         }
 
-    fn make_test_response(mut response: Resp) -> TestResponse {
-        let status_code = response.status().as_u16() as i32;
-        let body = response
-            .body()
-            .wait()
-            .ok()
-            .and_then(|body| String::from_utf8(body.to_vec()).ok());
-        let content_type_header = response
-            .headers()
-            .get(actix_web::http::header::CONTENT_TYPE);
-        let content_type = content_type_header
-            .and_then(|ct| ct.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
+//         fn post(&self, url: &str, body: &str) -> TestResponse {
+//             let request = self
+//                 .srv
+//                 .post(url)
+//                 .header(awc::http::header::CONTENT_TYPE, "application/json");
+//             block_on(request.send_body(body.to_string()).then(make_test_response))
+//                 .expect(&format!("failed POST {}", url))
+//         }
+//     }
 
-        TestResponse {
-            status_code,
-            body,
-            content_type,
-        }
-    }
+//     type Resp = Result<
+//         awc::ClientResponse<
+//             actix_http::encoding::Decoder<actix_http::Payload<actix_http::PayloadStream>>,
+//         >,
+//         awc::error::SendRequestError,
+//     >;
 
-    fn test_endpoint(url: &str, expected: &str) {
-        println!("URL: {}", url);
-        let body = actix_rt::System::new("endpoint_test")
-            .block_on(lazy(|| {
-                awc::Client::default()
-                    .get(url.to_string())
-                    .send()
-                    .map(|mut response| {
-                        let body = response.body().wait().unwrap();
-                        String::from_utf8(body.to_vec()).unwrap()
-                    })
-            }))
-            .expect(&format!("failed GET {}", url));
+//     async fn make_test_response(
+//         response: Resp,
+//     ) -> Result<TestResponse, awc::error::SendRequestError> {
+//         let mut response = response?;
+//         let status_code = response.status().as_u16() as i32;
+//         let body = response
+//             .body()
+//             .await
+//             .ok()
+//             .and_then(|body| String::from_utf8(body.to_vec()).ok());
+//         let content_type_header = response
+//             .headers()
+//             .get(actix_web::http::header::CONTENT_TYPE);
+//         let content_type = content_type_header
+//             .and_then(|ct| ct.to_str().ok())
+//             .unwrap_or_default()
+//             .to_string();
 
-        assert_eq!(body, expected);
-    }
+//         Ok(TestResponse {
+//             status_code,
+//             body,
+//             content_type,
+//         })
+//     }
 
-    #[test]
-    fn test_actix_web_integration() {
-        let schema = Schema::new(Query, EmptyMutation::<Database>::new());
-        let context = Database::new();
-        let data = Arc::new(Data { schema, context });
+//     #[actix_rt::test]
+//     async fn test_actix_web_integration() {
+//         let schema = Schema::new(Query, EmptyMutation::<Database>::new());
+//         let context = Database::new();
+//         let data = Arc::new(Data { schema, context });
 
-        let base_url = "localhost:8088";
+//         let srv = start(move || {
+//             App::new().data(data.clone()).service(
+//                 web::resource("/")
+//                     .guard(guard::Any(guard::Get()).or(guard::Post()))
+//                     .to(|st: web::Data<Arc<Data>>, data: GraphQLRequest| {
+//                         ready(data.execute(&st.schema, &st.context))
+//                     }),
+//             )
+//         });
 
-        #[cfg(feature = "async")]
-        let async_base_url = "localhost:8088";
+//         println!("Srv created");
 
-        let protocol_base_url = "http://localhost:8088/";
+//         let sync_test = TestActixWebIntegration::new(srv);
+//         run_http_test_suite(&sync_test);
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        let join = std::thread::spawn(move || {
-            let sys = actix_rt::System::new("test-integration-server");
-            let app = HttpServer::new(move || {
-                let app = App::new()
-                    .data(data.clone())
-                    .service(
-                        web::resource("/")
-                            .guard(guard::Any(guard::Get()).or(guard::Post()))
-                            .to(|st: web::Data<Arc<Data>>, data: GraphQLRequest| {
-                                data.execute(&st.schema, &st.context)
-                            }),
-                    )
-                    .service(
-                        web::resource("/graphiql")
-                            .route(web::get().to(move || graphiql_source(protocol_base_url))),
-                    )
-                    .service(
-                        web::resource("/playground")
-                            .route(web::get().to(move || playground_source(protocol_base_url))),
-                    );
+//         // #[cfg(feature = "async")]
+//         // {
+//         //     let mut srv = start(|| {
+//         //         App::new().service(web::resource("/").to(
+//         //             |st: web::Data<Arc<Data>>, data: GraphQLRequest| {
+//         //                 data.execute_async(&st.schema, &st.context)
+//         //             },
+//         //         ))
+//         //     });
+//         //     let async_test = TestActixWebIntegration::new(srv);
+//         //     run_http_test_suite(&async_test);
+//         // }
 
-                #[cfg(feature = "async")]
-                let app = app.service(
-                    web::resource("/async/")
-                        .guard(guard::Any(guard::Get()).or(guard::Post()))
-                        .to_async(|st: web::Data<Arc<Data>>, data: GraphQLRequest| {
-                            let f =
-                                async move { data.execute_async(&st.schema, &st.context).await };
-                            Box::new(f.unit_error().boxed().compat())
-                        }),
-                );
+//         // let mut srv = start(move || {
+//         //     App::new()
+//         //         .service(
+//         //             web::resource("/graphiql")
+//         //                 .route(web::get().to(move || graphiql_source(protocol_base_url))),
+//         //         )
+//         //         .service(
+//         //             web::resource("/playground")
+//         //                 .route(web::get().to(move || playground_source(protocol_base_url))),
+//         //         )
+//         // });
 
-                app
-            })
-            .shutdown_timeout(0)
-            .bind(base_url)
-            .unwrap();
+//         // let tester = TestActixWebIntegration::new(srv);
 
-            tx.send(app.system_exit().start()).unwrap();
-            sys.run().unwrap();
-        });
+//         // tester.test_endpoint("graphiql", &graphiql::graphiql_source(protocol_base_url));
 
-        let server = rx.recv().unwrap();
-
-        run_http_test_suite(&TestActixWebIntegration::new(base_url));
-
-        #[cfg(feature = "async")]
-        run_http_test_suite(&TestActixWebIntegration::new(async_base_url));
-
-        test_endpoint(
-            "http://localhost:8088/graphiql",
-            &graphiql::graphiql_source(protocol_base_url),
-        );
-        test_endpoint(
-            "http://localhost:8088/playground",
-            &playground::playground_source(protocol_base_url),
-        );
-
-        server.stop(true).wait().unwrap();
-        join.join().unwrap();
-    }
-}
+//         // tester.test_endpoint(
+//         //     "playground",
+//         //     &playground::playground_source(protocol_base_url),
+//         // );
+//     }
+// }
